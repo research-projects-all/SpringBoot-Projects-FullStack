@@ -30,9 +30,32 @@ jobs:
         run: |
           set -uo pipefail
           FAILED_PROJECTS=""
+          SKIPPED_PROJECTS=""
+
+          # Plugins that are known-broken in public CI (no auth, repo gone, etc.)
+          BLOCKED_PLUGINS=(
+            "org.springframework.experimental:spring-aot-maven-plugin"
+          )
 
           while IFS= read -r pom; do
             dir=$(dirname "$pom")
+
+            # Check if this pom references any blocked plugin before attempting compile
+            skip=false
+            for plugin in "${BLOCKED_PLUGINS[@]}"; do
+              if grep -q "$plugin" "$pom" 2>/dev/null; then
+                skip=true
+                blocked_by="$plugin"
+                break
+              fi
+            done
+
+            if [ "$skip" = true ]; then
+              echo "::warning file=$pom::Skipping $dir — references blocked plugin: $blocked_by"
+              SKIPPED_PROJECTS="$SKIPPED_PROJECTS\n  - $dir  (blocked plugin: $blocked_by)"
+              continue
+            fi
+
             echo "::group::Compiling $dir"
             if mvn -B -q -f "$pom" \
                 -DskipTests \
@@ -40,19 +63,23 @@ jobs:
                 clean compile 2>&1; then
               echo "  OK"
             else
-              echo "  SKIPPED (build failed - plugin or dependency unresolvable)"
+              echo "  FAILED"
               FAILED_PROJECTS="$FAILED_PROJECTS\n  - $dir"
             fi
             echo "::endgroup::"
           done < <(find . -name pom.xml -not -path '*/target/*' | sort)
 
+          echo ""
+          if [ -n "$SKIPPED_PROJECTS" ]; then
+            echo "Projects skipped (blocked plugin — analyzed source-only by Sonar):"
+            printf '%b\n' "$SKIPPED_PROJECTS"
+          fi
           if [ -n "$FAILED_PROJECTS" ]; then
-            echo ""
-            echo "The following projects were skipped and will be analyzed source-only:"
+            echo "Projects that failed unexpectedly:"
             printf '%b\n' "$FAILED_PROJECTS"
           fi
 
-          # Always exit 0 — partial binaries are fine for Sonar source analysis
+          # Exit 0 — partial binaries are fine for Sonar source analysis
           exit 0
 
       - name: SonarCloud scan
