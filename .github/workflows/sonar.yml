@@ -32,8 +32,8 @@ jobs:
         shell: bash
         run: |
           cat > sonar-project.properties <<EOF
-          sonar.projectKey=${{ secrets.research-projects-all_SpringBoot-Projects-FullStack }}
-          sonar.organization=${{ secrets.research-projects-all }}
+          sonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+          sonar.organization=${{ secrets.SONAR_ORGANIZATION }}
           sonar.host.url=https://sonarcloud.io
 
           sonar.sources=.
