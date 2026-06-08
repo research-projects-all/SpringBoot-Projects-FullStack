@@ -1,21 +1,17 @@
 name: SonarCloud
-
 on:
   push:
     branches: [main, master, develop]
   pull_request:
     types: [opened, synchronize, reopened]
-
 permissions:
   contents: read
   pull-requests: read
-
 jobs:
   sonarcloud:
     name: Build and analyze with SonarCloud
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,63 +25,35 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Compile Maven projects that CI can resolve
+      - name: Compile all Maven projects (best-effort)
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          FAILED_PROJECTS=""
 
-          # These modules use Spring Native / spring-aot-maven-plugin artifacts from
-          # repo.spring.io/release. GitHub Actions receives 401 for those artifacts,
-          # so the Sonar job must not compile or scan them unless the POMs are migrated.
-          skip_dirs=(
-            "./Advanced-SpringSecure/Spring-BaseAuth"
-            "./Advanced-SpringSecure/form-based-authentication/form-based-authentication"
-            "./Advanced-SpringSecure/simple-secure-start/secure-start"
-            "./Advanced-SpringSecure/spring-csrf-token/spring-csrf-token"
-            "./Advanced-SpringSecure/spring-login-password"
-            "./Advanced-SpringSecure/spring-management-api/spring-management-api"
-            "./Advanced-SpringSecure/spring-pre-authorize/spring-pre-authorize"
-            "./Advanced-SpringSecure/spring-rolebase-auth"
-            "./Advanced-SpringSecure/spring-security-encode"
-            "./Part-9.1. SpringReactive-Redis-Projects/Project-1 SpringReactiveRedis/ReactiveRedisProject"
-          )
-
-          should_skip() {
-            local dir="$1"
-            for skipped in "${skip_dirs[@]}"; do
-              if [[ "$dir" == "$skipped" ]]; then
-                return 0
-              fi
-            done
-            return 1
-          }
-
-          # Ensure sonar.java.binaries always points at at least one compiled class.
-          # Real module classes from target/classes still take precedence when builds pass.
-          mkdir -p .sonar-java-binaries
-          cat > .sonar-java-binaries/SonarPlaceholder.java <<'JAVA'
-          public class SonarPlaceholder {}
-          JAVA
-          javac -d .sonar-java-binaries .sonar-java-binaries/SonarPlaceholder.java
-          rm .sonar-java-binaries/SonarPlaceholder.java
-
-          failed=0
           while IFS= read -r pom; do
-            module_dir="$(dirname "$pom")"
-
-            if should_skip "$module_dir"; then
-              echo "Skipping unresolved Spring Native module: $module_dir"
-              continue
+            dir=$(dirname "$pom")
+            echo "::group::Compiling $dir"
+            if mvn -B -q -f "$pom" \
+                -DskipTests \
+                --no-transfer-progress \
+                clean compile 2>&1; then
+              echo "  OK"
+            else
+              echo "  SKIPPED (build failed - plugin or dependency unresolvable)"
+              FAILED_PROJECTS="$FAILED_PROJECTS\n  - $dir"
             fi
-
-            echo "Compiling $module_dir"
-            if ! mvn -B -q -f "$pom" -DskipTests clean compile; then
-              echo "::warning file=$pom::Maven compile failed; SonarCloud scan will continue with available compiled classes."
-              failed=$((failed + 1))
-            fi
+            echo "::endgroup::"
           done < <(find . -name pom.xml -not -path '*/target/*' | sort)
 
-          echo "Maven modules with compile failures: $failed"
+          if [ -n "$FAILED_PROJECTS" ]; then
+            echo ""
+            echo "The following projects were skipped and will be analyzed source-only:"
+            printf '%b\n' "$FAILED_PROJECTS"
+          fi
+
+          # Always exit 0 — partial binaries are fine for Sonar source analysis
+          exit 0
 
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v8.1.0
@@ -96,5 +64,5 @@ jobs:
             -Dsonar.organization=research-projects-all
             -Dsonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack
             -Dsonar.sources=.
-            -Dsonar.java.binaries=.sonar-java-binaries,**/target/classes
-            -Dsonar.exclusions=**/target/**,**/.mvn/**,**/mvnw,**/mvnw.cmd,Advanced-SpringSecure/Spring-BaseAuth/**,Advanced-SpringSecure/form-based-authentication/form-based-authentication/**,Advanced-SpringSecure/simple-secure-start/secure-start/**,Advanced-SpringSecure/spring-csrf-token/spring-csrf-token/**,Advanced-SpringSecure/spring-login-password/**,Advanced-SpringSecure/spring-management-api/spring-management-api/**,Advanced-SpringSecure/spring-pre-authorize/spring-pre-authorize/**,Advanced-SpringSecure/spring-rolebase-auth/**,Advanced-SpringSecure/spring-security-encode/**,Part-9.1. SpringReactive-Redis-Projects/Project-1 SpringReactiveRedis/ReactiveRedisProject/**
+            -Dsonar.java.binaries=**/target/classes
+            -Dsonar.exclusions=**/target/**,**/.mvn/**,**/mvnw,**/mvnw.cmd
