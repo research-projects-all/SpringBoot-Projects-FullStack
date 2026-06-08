@@ -20,8 +20,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The repo has a mix of Java 8, 11, and 15 projects.
-      # JDK 17 compiles all of them (--release flag handles source compat).
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -29,80 +27,65 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # ── Maven projects ────────────────────────────────────────────────────
-      # 10 poms declare spring-native 0.12.1 + spring-aot-maven-plugin, which
-      # pulls from repo.spring.io/release (now 401). We strip those blocks at
-      # CI time via a Maven extension so the source still compiles and Sonar
-      # gets real bytecode rather than a source-only stub.
+      # Write the pom-patching script using python3 itself (no heredoc needed).
+      # Strips the dead spring-aot-maven-plugin + spring-native blocks that
+      # cause 401s against the now-restricted repo.spring.io/release.
+      - name: Write pom patcher script
+        run: |
+          python3 -c "
+          script = '''
+          import sys, re
+          content = open(sys.argv[1]).read()
+          content = re.sub(r\"\s*<pluginRepository>.*?spring-releases.*?</pluginRepository>\", \"\", content, flags=re.DOTALL)
+          content = re.sub(r\"\s*<plugin>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-aot-maven-plugin</artifactId>.*?</plugin>\", \"\", content, flags=re.DOTALL)
+          content = re.sub(r\"\s*<dependency>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-native</artifactId>.*?</dependency>\", \"\", content, flags=re.DOTALL)
+          open(sys.argv[2], \"w\").write(content)
+          '''
+          open('/tmp/patch_pom.py', 'w').write(script.strip())
+          "
+
+      # ── Maven projects ─────────────────────────────────────────────────────
+      # 10 poms declare spring-native 0.12.1 + spring-aot-maven-plugin.
+      # The patcher removes those blocks so they compile cleanly and Sonar
+      # gets real bytecode instead of source-only stubs.
       - name: Compile Maven projects
         shell: bash
         run: |
           set -uo pipefail
-          SKIPPED="" FAILED=""
+          FAILED=""
 
           while IFS= read -r pom; do
             dir=$(dirname "$pom")
             echo "::group::Compiling $dir"
 
-            # Build the extra flags list dynamically
-            extra_flags=()
-
-            # If this pom references the dead spring-native experimental stack,
-            # exclude the plugin and override the broken pluginRepository so
-            # Maven doesn't even try to contact repo.spring.io/release.
-            # The spring-native *dependency* is left in place — Sonar can still
-            # analyse the source references; it just won't be on the classpath.
+            target_pom="$pom"
             if grep -q "spring-aot-maven-plugin\|spring-native.version" "$pom" 2>/dev/null; then
-              extra_flags+=(
-                "-Dspring-native.version=SKIP"
-                "-Dmaven.plugin.validation=NONE"
-                "--offline"
-              )
-              # Patch pluginRepositories out of the pom for this run only
               patched_pom=$(mktemp /tmp/pom-XXXX.xml)
-              # Remove the entire spring-releases pluginRepository block
-              python3 - "$pom" "$patched_pom" <<'PYEOF'
-import sys, re
-content = open(sys.argv[1]).read()
-# Remove <pluginRepository> blocks referencing repo.spring.io
-content = re.sub(
-    r'\s*<pluginRepository>.*?spring-releases.*?</pluginRepository>',
-    '', content, flags=re.DOTALL)
-# Remove the spring-aot-maven-plugin <plugin> block
-content = re.sub(
-    r'\s*<plugin>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-aot-maven-plugin</artifactId>.*?</plugin>',
-    '', content, flags=re.DOTALL)
-# Remove spring-native dependency
-content = re.sub(
-    r'\s*<dependency>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-native</artifactId>.*?</dependency>',
-    '', content, flags=re.DOTALL)
-open(sys.argv[2], 'w').write(content)
-PYEOF
-              pom="$patched_pom"
+              python3 /tmp/patch_pom.py "$pom" "$patched_pom"
+              target_pom="$patched_pom"
+              echo "  (spring-native blocks patched out)"
             fi
 
-            build_output=$(mvn -B -q -f "$pom" \
+            build_output=$(mvn -B -q -f "$target_pom" \
               -DskipTests \
               --no-transfer-progress \
-              "${extra_flags[@]}" \
               clean compile 2>&1) && rc=0 || rc=$?
 
             if [ $rc -eq 0 ]; then
-              echo "  ✅ OK"
+              echo "  OK"
             else
               echo "$build_output"
-              echo "  ❌ FAILED"
+              echo "  FAILED"
               FAILED="$FAILED\n  - $dir"
             fi
             echo "::endgroup::"
           done < <(find . -name pom.xml -not -path '*/target/*' | sort)
 
-          [ -n "$FAILED" ] && { printf '\n❌ Unexpected failures:\n%b\n' "$FAILED"; }
-          exit 0   # partial bytecode is fine; Sonar still analyses everything
+          [ -n "$FAILED" ] && printf '\nUnexpected compile failures:\n%b\n' "$FAILED"
+          exit 0
 
-      # ── Gradle projects ───────────────────────────────────────────────────
+      # ── Gradle projects ────────────────────────────────────────────────────
       # 4 projects use Gradle (MongoDB CRUD, GitApi, SpringSecLogInOut, SpringGradle).
-      # compile only — no tests, no daemon in CI.
       - name: Set up Gradle cache
         uses: actions/cache@v4
         with:
@@ -128,19 +111,19 @@ PYEOF
                 -x test 2>&1) && rc=0 || rc=$?
 
             if [ $rc -eq 0 ]; then
-              echo "  ✅ OK"
+              echo "  OK"
             else
               echo "$build_output"
-              echo "  ⚠️  SKIPPED (Gradle compile failed — source-only Sonar analysis)"
+              echo "  SKIPPED (source-only Sonar analysis)"
               FAILED="$FAILED\n  - $dir"
             fi
             echo "::endgroup::"
           done < <(find . -name build.gradle -not -path '*/target/*' | sort)
 
-          [ -n "$FAILED" ] && { printf '\nGradle skipped (source-only):\n%b\n' "$FAILED"; }
+          [ -n "$FAILED" ] && printf '\nGradle skipped (source-only):\n%b\n' "$FAILED"
           exit 0
 
-      # ── SonarCloud ────────────────────────────────────────────────────────
+      # ── SonarCloud ─────────────────────────────────────────────────────────
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v8.1.0
         env:
