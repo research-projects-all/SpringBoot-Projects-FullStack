@@ -27,9 +27,6 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # Write the pom-patching script using python3 itself (no heredoc needed).
-      # Strips the dead spring-aot-maven-plugin + spring-native blocks that
-      # cause 401s against the now-restricted repo.spring.io/release.
       - name: Write pom patcher script
         run: |
           python3 -c "
@@ -45,13 +42,6 @@ jobs:
           "
 
       # ── Maven projects ─────────────────────────────────────────────────────
-      # Known fixable failures handled via compiler flags:
-      #   • spring-native/spring-aot-maven-plugin (401) → patched out of pom
-      #   • Lombok < 1.18.20 on JDK17 → pinned to 1.18.30 via property override
-      #   • Boot 1.4.1 defaulting to Java 6 source/target → overridden to 8
-      #   • com.sun.istack.internal (removed JDK9+) → --add-exports at compile
-      # Genuine source bugs (merge conflicts, missing fields) remain as FAILED
-      # but do not abort the pipeline (exit 0 at end).
       - name: Compile Maven projects
         shell: bash
         run: |
@@ -74,9 +64,8 @@ jobs:
             fi
 
             # Fix 2: Lombok < 1.18.20 breaks on JDK17 — override to 1.18.30
-            # Affects: Boot 2.2.x/2.3.x/2.4.x which ship lombok 1.18.12–1.18.16
             boot_ver=$(python3 -c "
-          import re, sys
+          import re
           c = open('$pom').read()
           m = re.search(r'spring-boot-starter-parent.*?<version>([^<]+)</version>', c, re.DOTALL)
           print(m.group(1) if m else '')
@@ -88,17 +77,17 @@ jobs:
                 ;;
             esac
 
-            # Fix 3: Boot 1.4.1 defaults to Java 6 source/target — JDK17 dropped support
+            # Fix 3: Boot 1.x defaults to Java 6 source/target — dropped in JDK17
             case "$boot_ver" in
               1.*)
                 extra_flags+=("-Dmaven.compiler.source=8" "-Dmaven.compiler.target=8")
-                echo "  (compiler source/target overridden to 8 for Boot $boot_ver)"
+                echo "  (compiler source/target set to 8 for Boot $boot_ver)"
                 ;;
             esac
 
-            # Fix 4: com.sun.istack.internal removed in JDK9+ — add-exports to unblock compile
+            # Fix 4: com.sun.istack.internal removed in JDK9+
             if grep -rq "com\.sun\.istack" "$(dirname "$pom")/src" 2>/dev/null; then
-              extra_flags+=("-Dmaven.compiler.compilerArgs=--add-exports=java.xml.bind/com.sun.istack.internal=ALL-UNNAMED")
+              extra_flags+=("-Dmaven.compiler.compilerArg=--add-exports=java.xml.bind/com.sun.istack.internal=ALL-UNNAMED")
               echo "  (--add-exports for com.sun.istack.internal)"
             fi
 
@@ -122,9 +111,6 @@ jobs:
           exit 0
 
       # ── Gradle projects ────────────────────────────────────────────────────
-      # All 4 Gradle projects use old APIs removed in Gradle 7+ (getUploadTaskName).
-      # They need Gradle 4/5 to build. Rather than install old Gradle, we let them
-      # stay as source-only — Sonar still indexes and analyses the .java files.
       - name: Set up Gradle cache
         uses: actions/cache@v4
         with:
@@ -162,34 +148,51 @@ jobs:
           [ -n "$FAILED" ] && printf '\nGradle skipped (source-only):\n%b\n' "$FAILED"
           exit 0
 
-      # ── Collect actual binaries that were produced ─────────────────────────
-      # sonar.java.binaries must only list paths that EXIST — if a glob matches
-      # nothing, Sonar hard-crashes with IllegalStateException. We build the list
-      # dynamically from what's actually on disk after compilation.
-      - name: Collect binary paths for Sonar
-        id: binaries
+      # ── Write sonar-project.properties ─────────────────────────────────────
+      # sonar.java.binaries MUST be in sonar-project.properties, NOT passed as
+      # a CLI -D argument. The scanner splits CLI args on whitespace, so paths
+      # containing spaces (e.g. "Part-1 Spring Boot Basic Fund Projects/...")
+      # become "Unrecognized option: Spring". Properties files are parsed
+      # differently and handle spaces in values correctly.
+      - name: Write sonar-project.properties
         run: |
-          paths=$(find . \( -path '*/target/classes' -o -path '*/build/classes/java/main' \) \
-            -type d | sort | tr '\n' ',' | sed 's/,$//')
-          if [ -z "$paths" ]; then
-            # Fallback: tell Sonar to look everywhere — will warn but not crash
-            paths="."
-          fi
-          echo "paths=$paths" >> "$GITHUB_OUTPUT"
-          echo "Binary dirs found: $(echo "$paths" | tr ',' '\n' | wc -l)"
+          python3 -c "
+          import subprocess, os
+
+          # Collect every classes dir that actually exists after compilation
+          result = subprocess.run(
+            ['find', '.', '-type', 'd',
+             '(', '-path', '*/target/classes', '-o', '-path', '*/build/classes/java/main', ')'],
+            capture_output=True, text=True
+          )
+          # Use find with proper args
+          import glob
+          dirs = []
+          for pattern in ['**/target/classes', '**/build/classes/java/main']:
+            for d in glob.glob(pattern, recursive=True):
+              if os.path.isdir(d):
+                dirs.append(d)
+          dirs.sort()
+          binaries = ','.join(dirs) if dirs else '.'
+
+          lines = [
+            'sonar.organization=research-projects-all',
+            'sonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack',
+            'sonar.sources=.',
+            'sonar.java.binaries=' + binaries,
+            'sonar.tests=.',
+            'sonar.test.inclusions=**/src/test/**/*.java',
+            'sonar.exclusions=**/target/**,**/build/**,**/.mvn/**,**/mvnw,**/mvnw.cmd,**/node_modules/**,**/frontend/**',
+            'sonar.coverage.exclusions=**/test/**,**/*Test*.java,**/*Tests*.java,**/*Application.java',
+          ]
+          open('sonar-project.properties', 'w').write('\n'.join(lines) + '\n')
+          print('Written sonar-project.properties')
+          print('Binary dirs:', len(dirs))
+          "
 
       # ── SonarCloud ─────────────────────────────────────────────────────────
+      # No args= block — all config is read from sonar-project.properties.
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.organization=research-projects-all
-            -Dsonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack
-            -Dsonar.sources=.
-            -Dsonar.java.binaries=${{ steps.binaries.outputs.paths }}
-            -Dsonar.tests=.
-            -Dsonar.test.inclusions=**/src/test/**/*.java
-            -Dsonar.exclusions=**/target/**,**/build/**,**/.mvn/**,**/mvnw,**/mvnw.cmd,**/node_modules/**,**/frontend/**
-            -Dsonar.coverage.exclusions=**/test/**,**/*Test*.java,**/*Tests*.java,**/*Application.java
