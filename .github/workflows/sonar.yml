@@ -1,9 +1,11 @@
 name: SonarCloud
+
 on:
   push:
     branches: [main, master, develop]
   pull_request:
     types: [opened, synchronize, reopened]
+
 permissions:
   contents: read
   pull-requests: read
@@ -12,6 +14,7 @@ jobs:
   sonarcloud:
     name: Build and analyze with SonarCloud
     runs-on: ubuntu-latest
+
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
@@ -20,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Set up JDK 17 for Maven
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -28,170 +31,239 @@ jobs:
           cache: maven
 
       - name: Write pom patcher script
+        shell: bash
         run: |
-          python3 -c "
-          script = '''
-          import sys, re
-          content = open(sys.argv[1]).read()
-          content = re.sub(r\"\s*<pluginRepository>.*?spring-releases.*?</pluginRepository>\", \"\", content, flags=re.DOTALL)
-          content = re.sub(r\"\s*<plugin>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-aot-maven-plugin</artifactId>.*?</plugin>\", \"\", content, flags=re.DOTALL)
-          content = re.sub(r\"\s*<dependency>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-native</artifactId>.*?</dependency>\", \"\", content, flags=re.DOTALL)
-          open(sys.argv[2], \"w\").write(content)
-          '''
-          open('/tmp/patch_pom.py', 'w').write(script.strip())
-          "
+          set -euo pipefail
 
-      # ── Maven projects ─────────────────────────────────────────────────────
+          cat > /tmp/patch_pom.py <<'PY'
+          import sys
+          import re
+
+          source = sys.argv[1]
+          target = sys.argv[2]
+
+          with open(source, "r", encoding="utf-8", errors="ignore") as f:
+              content = f.read()
+
+          content = re.sub(
+              r"\s*<pluginRepository>.*?spring-releases.*?</pluginRepository>",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+
+          content = re.sub(
+              r"\s*<plugin>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-aot-maven-plugin</artifactId>.*?</plugin>",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+
+          content = re.sub(
+              r"\s*<dependency>\s*<groupId>org\.springframework\.experimental</groupId>\s*<artifactId>spring-native</artifactId>.*?</dependency>",
+              "",
+              content,
+              flags=re.DOTALL,
+          )
+
+          with open(target, "w", encoding="utf-8") as f:
+              f.write(content)
+          PY
+
       - name: Compile Maven projects
         shell: bash
         run: |
           set -uo pipefail
+
           FAILED=""
 
           while IFS= read -r pom; do
-            dir=$(dirname "$pom")
-            echo "::group::Compiling $dir"
+            dir="$(dirname "$pom")"
+            echo "::group::Compiling Maven project: $dir"
 
             target_pom="$pom"
             extra_flags=()
 
-            # Fix 1: strip dead spring-native experimental stack
-            if grep -q "spring-aot-maven-plugin\|spring-native.version" "$pom" 2>/dev/null; then
-              patched_pom=$(mktemp /tmp/pom-XXXX.xml)
-              python3 /tmp/patch_pom.py "$pom" "$patched_pom"
-              target_pom="$patched_pom"
-              echo "  (spring-native blocks patched out)"
+            # Patch only the CI workspace.
+            # This does not commit or change repository source code.
+            if grep -q "spring-aot-maven-plugin\|spring-native\|spring-native.version" "$pom" 2>/dev/null; then
+              target_pom="$dir/.ci-pom.xml"
+              python3 /tmp/patch_pom.py "$pom" "$target_pom"
+              echo "Patched Spring Native / AOT blocks for CI compile"
             fi
 
-            # Fix 2: Lombok < 1.18.20 breaks on JDK17 — override to 1.18.30
-            boot_ver=$(python3 -c "
+            boot_ver="$(python3 - "$pom" <<'PY'
           import re
-          c = open('$pom').read()
-          m = re.search(r'spring-boot-starter-parent.*?<version>([^<]+)</version>', c, re.DOTALL)
-          print(m.group(1) if m else '')
-          " 2>/dev/null)
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="ignore") as f:
+              content = f.read()
+
+          match = re.search(
+              r"<artifactId>\s*spring-boot-starter-parent\s*</artifactId>\s*<version>\s*([^<]+)\s*</version>",
+              content,
+              re.DOTALL,
+          )
+
+          print(match.group(1).strip() if match else "")
+          PY
+          )"
+
             case "$boot_ver" in
               2.2.*|2.3.*|2.4.*)
                 extra_flags+=("-Dlombok.version=1.18.30")
-                echo "  (lombok pinned to 1.18.30 for Boot $boot_ver)"
+                echo "Using Lombok 1.18.30 for Spring Boot $boot_ver"
                 ;;
             esac
 
-            # Fix 3: Boot 1.x defaults to Java 6 source/target — dropped in JDK17
             case "$boot_ver" in
               1.*)
                 extra_flags+=("-Dmaven.compiler.source=8" "-Dmaven.compiler.target=8")
-                echo "  (compiler source/target set to 8 for Boot $boot_ver)"
+                echo "Using Java source/target 8 for Spring Boot $boot_ver"
                 ;;
             esac
 
-            # Fix 4: com.sun.istack.internal removed in JDK9+
-            if grep -rq "com\.sun\.istack" "$(dirname "$pom")/src" 2>/dev/null; then
-              extra_flags+=("-Dmaven.compiler.compilerArg=--add-exports=java.xml.bind/com.sun.istack.internal=ALL-UNNAMED")
-              echo "  (--add-exports for com.sun.istack.internal)"
+            if [ -d "$dir/src" ] && grep -rq "com\.sun\.istack" "$dir/src" 2>/dev/null; then
+              extra_flags+=("-Dmaven.compiler.compilerArgs=--add-exports=java.xml.bind/com.sun.istack.internal=ALL-UNNAMED")
+              echo "Added compiler export for com.sun.istack.internal"
             fi
 
-            build_output=$(mvn -B -q -f "$target_pom" \
-              -DskipTests \
-              --no-transfer-progress \
-              "${extra_flags[@]}" \
-              clean compile 2>&1) && rc=0 || rc=$?
+            build_output="$(
+              mvn -B -q -f "$target_pom" \
+                -DskipTests \
+                -Dmaven.test.skip=true \
+                -Dcheckstyle.skip=true \
+                -Dpmd.skip=true \
+                -Dspotbugs.skip=true \
+                --no-transfer-progress \
+                "${extra_flags[@]}" \
+                clean compile 2>&1
+            )"
+            rc=$?
 
-            if [ $rc -eq 0 ]; then
-              echo "  OK"
+            if [ "$rc" -eq 0 ]; then
+              echo "OK"
             else
               echo "$build_output"
-              echo "  FAILED"
-              FAILED="$FAILED\n  - $dir"
+              echo "FAILED, but the SonarCloud scan will continue"
+              FAILED="$FAILED
+          - $dir"
             fi
-            echo "::endgroup::"
-          done < <(find . -name pom.xml -not -path '*/target/*' | sort)
 
-          [ -n "$FAILED" ] && printf '\nUnexpected compile failures:\n%b\n' "$FAILED"
+            echo "::endgroup::"
+          done < <(find . -name pom.xml -not -path "*/target/*" -not -name ".ci-pom.xml" | sort)
+
+          if [ -n "$FAILED" ]; then
+            printf '\nMaven projects that did not compile:%b\n' "$FAILED"
+          fi
+
           exit 0
 
-      # ── Gradle projects ────────────────────────────────────────────────────
-      - name: Set up Gradle cache
-        uses: actions/cache@v4
+      - name: Set up JDK 8 for old Gradle projects
+        uses: actions/setup-java@v4
         with:
-          path: ~/.gradle/caches
-          key: gradle-${{ hashFiles('**/*.gradle', '**/*.gradle.kts') }}
-          restore-keys: gradle-
+          distribution: temurin
+          java-version: '8'
+
+      - name: Set up Gradle 5.6.4
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 5.6.4
 
       - name: Compile Gradle projects
         shell: bash
         run: |
           set -uo pipefail
+
           FAILED=""
 
           while IFS= read -r build; do
-            dir=$(dirname "$build")
-            echo "::group::Compiling (Gradle) $dir"
+            dir="$(dirname "$build")"
+            echo "::group::Compiling Gradle project: $dir"
 
-            build_output=$(cd "$dir" && \
+            build_output="$(
+              cd "$dir" && \
               gradle compileJava \
                 --no-daemon \
                 --quiet \
-                --warning-mode none \
-                -x test 2>&1) && rc=0 || rc=$?
+                -x test 2>&1
+            )"
+            rc=$?
 
-            if [ $rc -eq 0 ]; then
-              echo "  OK"
+            if [ "$rc" -eq 0 ]; then
+              echo "OK"
             else
               echo "$build_output"
-              echo "  SKIPPED (source-only Sonar analysis)"
-              FAILED="$FAILED\n  - $dir"
+              echo "FAILED, but the SonarCloud scan will continue"
+              FAILED="$FAILED
+          - $dir"
             fi
-            echo "::endgroup::"
-          done < <(find . -name build.gradle -not -path '*/target/*' | sort)
 
-          [ -n "$FAILED" ] && printf '\nGradle skipped (source-only):\n%b\n' "$FAILED"
+            echo "::endgroup::"
+          done < <(find . -name build.gradle -not -path "*/target/*" -not -path "*/build/*" | sort)
+
+          if [ -n "$FAILED" ]; then
+            printf '\nGradle projects that did not compile:%b\n' "$FAILED"
+          fi
+
           exit 0
 
-      # ── Write sonar-project.properties ─────────────────────────────────────
-      # sonar.java.binaries MUST be in sonar-project.properties, NOT passed as
-      # a CLI -D argument. The scanner splits CLI args on whitespace, so paths
-      # containing spaces (e.g. "Part-1 Spring Boot Basic Fund Projects/...")
-      # become "Unrecognized option: Spring". Properties files are parsed
-      # differently and handle spaces in values correctly.
-      - name: Write sonar-project.properties
+      - name: Set up JDK 17 for SonarCloud
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create SonarCloud properties
+        shell: bash
         run: |
-          python3 -c "
-          import subprocess, os
+          set -euo pipefail
 
-          # Collect every classes dir that actually exists after compilation
-          result = subprocess.run(
-            ['find', '.', '-type', 'd',
-             '(', '-path', '*/target/classes', '-o', '-path', '*/build/classes/java/main', ')'],
-            capture_output=True, text=True
-          )
-          # Use find with proper args
-          import glob
-          dirs = []
-          for pattern in ['**/target/classes', '**/build/classes/java/main']:
-            for d in glob.glob(pattern, recursive=True):
-              if os.path.isdir(d):
-                dirs.append(d)
-          dirs.sort()
-          binaries = ','.join(dirs) if dirs else '.'
+          binary_paths="$(
+            find . \
+              \( -path "*/target/classes" -o -path "*/build/classes/java/main" \) \
+              -type d \
+              | sort \
+              | paste -sd, -
+          )"
 
-          lines = [
-            'sonar.organization=research-projects-all',
-            'sonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack',
-            'sonar.sources=.',
-            'sonar.java.binaries=' + binaries,
-            'sonar.tests=.',
-            'sonar.test.inclusions=**/src/test/**/*.java',
-            'sonar.exclusions=**/target/**,**/build/**,**/.mvn/**,**/mvnw,**/mvnw.cmd,**/node_modules/**,**/frontend/**',
-            'sonar.coverage.exclusions=**/test/**,**/*Test*.java,**/*Tests*.java,**/*Application.java',
-          ]
-          open('sonar-project.properties', 'w').write('\n'.join(lines) + '\n')
-          print('Written sonar-project.properties')
-          print('Binary dirs:', len(dirs))
-          "
+          if [ -z "$binary_paths" ]; then
+            binary_paths="."
+          fi
 
-      # ── SonarCloud ─────────────────────────────────────────────────────────
-      # No args= block — all config is read from sonar-project.properties.
+          test_paths="$(
+            find . \
+              \( -path "*/src/test" -o -path "*/src/test/java" \) \
+              -type d \
+              | sort \
+              | paste -sd, -
+          )"
+
+          cat > sonar-project.properties <<EOF
+          sonar.organization=research-projects-all
+          sonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack
+          sonar.host.url=https://sonarcloud.io
+
+          sonar.sources=.
+          sonar.sourceEncoding=UTF-8
+
+          sonar.java.binaries=$binary_paths
+
+          sonar.exclusions=**/target/**,**/build/**,**/.git/**,**/.github/**,**/.mvn/**,**/mvnw,**/mvnw.cmd,**/node_modules/**,**/frontend/**,**/.ci-pom.xml,**/src/test/**
+          sonar.coverage.exclusions=**/test/**,**/*Test*.java,**/*Tests*.java,**/*Application.java
+          EOF
+
+          if [ -n "$test_paths" ]; then
+            {
+              echo "sonar.tests=$test_paths"
+              echo "sonar.test.inclusions=**/*.java"
+            } >> sonar-project.properties
+          fi
+
+          echo "Generated sonar-project.properties"
+          echo "Binary directories found:"
+          echo "$binary_paths" | tr ',' '\n' | wc -l
+
       - name: SonarCloud scan
         uses: SonarSource/sonarqube-scan-action@v8.1.0
         env:
