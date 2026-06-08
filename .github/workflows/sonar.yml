@@ -1,95 +1,58 @@
 name: SonarCloud
+
 on:
   push:
-    branches: [main, master, develop]
+    branches:
+      - main
+      - master
   pull_request:
-    types: [opened, synchronize, reopened]
-permissions:
-  contents: read
-  pull-requests: read
+    branches:
+      - main
+      - master
+
 jobs:
   sonarcloud:
-    name: Build and analyze with SonarCloud
+    name: SonarCloud scan
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
         with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
 
-      - name: Compile all Maven projects (best-effort)
+      - name: Create SonarCloud properties
         shell: bash
         run: |
-          set -uo pipefail
-          FAILED_PROJECTS=""
-          SKIPPED_PROJECTS=""
+          cat > sonar-project.properties <<EOF
+          sonar.projectKey=${{ secrets.research-projects-all_SpringBoot-Projects-FullStack }}
+          sonar.organization=${{ secrets.research-projects-all }}
+          sonar.host.url=https://sonarcloud.io
 
-          # Plugins that are known-broken in public CI (no auth, repo gone, etc.)
-          BLOCKED_PLUGINS=(
-            "org.springframework.experimental:spring-aot-maven-plugin"
-          )
+          sonar.sources=.
+          sonar.sourceEncoding=UTF-8
 
-          while IFS= read -r pom; do
-            dir=$(dirname "$pom")
+          # This repo contains many independent Maven sample projects.
+          # Some projects fail because of old dependencies, Java 6 settings,
+          # or source files that do not compile on the GitHub runner.
+          #
+          # Do not run mvn compile here.
+          # This keeps SonarCloud scanning source files without changing code.
+          sonar.java.binaries=.
 
-            # Check if this pom references any blocked plugin before attempting compile
-            skip=false
-            for plugin in "${BLOCKED_PLUGINS[@]}"; do
-              if grep -q "$plugin" "$pom" 2>/dev/null; then
-                skip=true
-                blocked_by="$plugin"
-                break
-              fi
-            done
+          sonar.exclusions=**/target/**,**/.git/**,**/.github/**
+          EOF
 
-            if [ "$skip" = true ]; then
-              echo "::warning file=$pom::Skipping $dir — references blocked plugin: $blocked_by"
-              SKIPPED_PROJECTS="$SKIPPED_PROJECTS\n  - $dir  (blocked plugin: $blocked_by)"
-              continue
-            fi
+          cat sonar-project.properties
 
-            echo "::group::Compiling $dir"
-            if mvn -B -q -f "$pom" \
-                -DskipTests \
-                --no-transfer-progress \
-                clean compile 2>&1; then
-              echo "  OK"
-            else
-              echo "  FAILED"
-              FAILED_PROJECTS="$FAILED_PROJECTS\n  - $dir"
-            fi
-            echo "::endgroup::"
-          done < <(find . -name pom.xml -not -path '*/target/*' | sort)
-
-          echo ""
-          if [ -n "$SKIPPED_PROJECTS" ]; then
-            echo "Projects skipped (blocked plugin — analyzed source-only by Sonar):"
-            printf '%b\n' "$SKIPPED_PROJECTS"
-          fi
-          if [ -n "$FAILED_PROJECTS" ]; then
-            echo "Projects that failed unexpectedly:"
-            printf '%b\n' "$FAILED_PROJECTS"
-          fi
-
-          # Exit 0 — partial binaries are fine for Sonar source analysis
-          exit 0
-
-      - name: SonarCloud scan
-        uses: SonarSource/sonarqube-scan-action@v8.1.0
+      - name: Run SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v7
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.organization=research-projects-all
-            -Dsonar.projectKey=research-projects-all_SpringBoot-Projects-FullStack
-            -Dsonar.sources=.
-            -Dsonar.java.binaries=**/target/classes
-            -Dsonar.exclusions=**/target/**,**/.mvn/**,**/mvnw,**/mvnw.cmd
